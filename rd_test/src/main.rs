@@ -40,7 +40,7 @@ async fn main() {
             // Create thread-specific topic name
 
             // Create producer with dedicated topic
-            let producer: ThreadedProducer<> = ClientConfig::new()
+            let producer: BaseProducer = ClientConfig::new()
                 .set("bootstrap.servers", &brokers)
                 .set("linger.ms", "1")
                 .set("batch.num.messages", "1000")
