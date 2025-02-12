@@ -133,20 +133,16 @@ impl LocalStats {
         self.error_count += 1;
     }
 
-    fn print(&self) {
-        let avg = self.latencies.iter().sum::<f64>() / self.latencies.len() as f64;
-        println!(
-            "[Thread {}] Batches: {} | Avg: {:.2}ms | Errors: {}",
-            self.thread_id, self.batch_count, avg, self.error_count
-        );
-    }
-
-    fn print_final(&self) {
+    fn print_final(&mut self) {
         let total_time = self.start_time.elapsed().as_secs_f64();
         let throughput = (self.batch_count * 1000) as f64 / total_time;
+        self.latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p99 = calculate_percentile(&self.latencies, 99.0);
+        let p95 = calculate_percentile(&self.latencies, 95.0);
+        let p50 = calculate_percentile(&self.latencies, 50.0);
         println!(
-            "[Thread {}] Final: {:.0} msg/s | Total Errors: {}",
-            self.thread_id, throughput, self.error_count
+            "[Thread {}] Final: {:.0} msg/s | p50: {:.2}ms | p95: {:.2}ms | p99: {:.2}ms | Errors: {}",
+            self.thread_id, throughput, p50, p95, p99, self.error_count
         );
     }
 }
