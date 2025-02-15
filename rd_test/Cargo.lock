@@ -453,12 +453,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ratelimit"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59051db7d98ac50dbd1f174badf73916e74ea8085c0328236dac17b5ad3d3a31"
+dependencies = [
+ "shuteye",
+]
+
+[[package]]
 name = "rd_test"
 version = "0.1.0"
 dependencies = [
  "env_logger",
  "futures",
  "log",
+ "ratelimit",
  "rdkafka",
  "tokio",
 ]
@@ -586,6 +596,12 @@ name = "shlex"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
+
+[[package]]
+name = "shuteye"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2fae018891baadd06ff0281ff137ccd1641044d9bb9498b1138ffecf28f30172"
 
 [[package]]
 name = "signal-hook-registry"

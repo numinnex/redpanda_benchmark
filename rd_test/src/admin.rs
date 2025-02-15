@@ -53,9 +53,10 @@ impl Admin {
         for topic in topics {
             let new_topic = NewTopic::new(topic, num_partitions, TopicReplication::Fixed(1));
             let new_topic = new_topic.set("segment.bytes", "1073741824");
+            let new_topic = new_topic.set("write.caching", "false");
             xd.push(new_topic);
         }
-        let res = self
+        let _ = self
             .client
             .create_topics(
                 &xd,

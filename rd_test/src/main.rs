@@ -1,4 +1,5 @@
 use std::{
+    num::NonZeroU32,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -17,17 +18,18 @@ use rdkafka::{
     util::Timeout,
     ClientConfig, Message, Timestamp, TopicPartitionList,
 };
-use tokio::{task, time::Instant};
+use tokio::time::Instant;
 pub mod admin;
-use std::thread;
-
+use std::thread::sleep;
 #[tokio::main]
 async fn main() {
     let brokers = "localhost:19092";
     let base_topic = "test";
-    let total_messages = 3_000_000;
-    let num_producers = 3;
-    let messages_per_producer = total_messages / num_producers;
+    let total_messages = 8_000_000;
+    let num_producers: usize = 8;
+    let message_size = 1024;
+    let messages_in_batch = 1000;
+    let batches_count = (total_messages / messages_in_batch) / num_producers;
 
     let mut topics = Vec::new();
     for id in 0..num_producers {
@@ -53,11 +55,10 @@ async fn main() {
             let producer: Arc<BaseProducer> = Arc::new(
                 ClientConfig::new()
                     .set("bootstrap.servers", &brokers)
-                    .set("linger.ms", "100")
+                    .set("linger.ms", "10")
                     .set("batch.num.messages", "1000")
-                    .set("batch.size", "1048576") // 20MB
-                    .set("message.max.bytes", "1048588") // ~1MB
-                    .set("max.in.flight", "1")
+                    .set("batch.size", "1048588") 
+                    .set("message.max.bytes", "2048588") // ~2MB
                     .create()
                     .expect("Producer creation failed"),
             );
@@ -69,7 +70,7 @@ async fn main() {
                     .set("auto.offset.reset", "earliest")
                     .set("group.id", format!("manual_consumer_{}", thread_id))
                     .set("enable.auto.commit", "false")
-                    .set("fetch.min.bytes", "1048588") // ~1MB
+                    .set("fetch.min.bytes", "102400")
                     .create()
                     .expect("Consumer creation failed"),
             );
@@ -79,71 +80,56 @@ async fn main() {
             tpl.add_partition(topic, 0);
             consumer.assign(&tpl).expect("Assignment failed");
 
-            let payload = vec![0u8; 1024];
+            let payload = vec![0u8; message_size];
             let st = String::from_utf8(payload).unwrap();
             let mut stats = LocalStats::new(thread_id);
+            let mut batches_sent = 0;
 
-            for i in 1..=messages_per_producer {
-                let timestamp = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as i64;
+            while batches_sent < batches_count {
+                for _ in 1..=messages_in_batch {
+                    let timestamp = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as i64;
 
-                let record = BaseRecord::to(topic)
-                    .key("test")
-                    .payload(&st)
-                    .timestamp(timestamp);
+                    let record = BaseRecord::to(topic)
+                        .key("test")
+                        .payload(&st)
+                        .timestamp(timestamp);
 
-                if let Err((e, _)) = producer.send(record) {
-                    stats.log_error();
-                    eprintln!("[Thread {}] Error: {}", thread_id, e);
+                    if let Err((e, _)) = producer.send(record) {
+                        stats.log_error();
+                        eprintln!("[Thread {}] Error: {}", thread_id, e);
+                    }
                 }
+                stats.record_batch();
+                producer.flush(Duration::from_secs(10)).unwrap();
+                batches_sent += 1;
+                let consumer = consumer.clone();
 
-                if i % 1000 == 0 {
-                    // Flush the producer in a blocking task
-                    let producer = producer.clone();
-                    let consumer = consumer.clone();
-                    producer.flush(Duration::from_secs(5)).unwrap();
-
-                    // Consume messages asynchronously
-                    let mut processed_count = 0;
-                    let mut latency_from_batch_stored = false;
-                    while let Some(message) = consumer.poll(Duration::from_millis(1)) {
-                        if processed_count == 999 {
-                            stats.record_batch();
-                            processed_count = 0;
-                            latency_from_batch_stored = false;
-                            // Commit synchronously
-                            consumer
-                                .commit_consumer_state(rdkafka::consumer::CommitMode::Async)
-                                .unwrap();
-                            break;
+                while let Some(message) = consumer.poll(Duration::from_millis(3)) {
+                    match message {
+                        Ok(msg) => {
+                            let timestamp = msg.timestamp();
+                            if let Some(t) = timestamp.to_millis() {
+                                let latency = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_millis()
+                                    as i64
+                                    - t;
+                                stats.record_latency(latency as f64);
+                            }
                         }
-                        match message {
-                            Ok(msg) => {
-                                let timestamp = msg.timestamp();
-                                processed_count += 1;
-                                if let Some(t) = timestamp.to_millis() {
-                                    if !latency_from_batch_stored {
-                                        let latency = SystemTime::now()
-                                            .duration_since(UNIX_EPOCH)
-                                            .unwrap()
-                                            .as_millis()
-                                            as i64
-                                            - t;
-                                        stats.record_latency(latency as f64);
-                                        latency_from_batch_stored = true;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("Error consuming message: {}", e);
-                            }
+                        Err(e) => {
+                            eprintln!("Error consuming message: {}", e);
                         }
                     }
                 }
+                consumer
+                     .commit_consumer_state(rdkafka::consumer::CommitMode::Async)
+                     .unwrap();
             }
-
             stats.print_final();
             stats
         });
