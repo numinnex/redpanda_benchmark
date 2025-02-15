@@ -44,7 +44,11 @@ impl Admin {
         Ok(())
     }
 
-    pub async fn create_topics(&self, topics: &Vec<String>, num_partitions: i32) -> KafkaResult<()> {
+    pub async fn create_topics(
+        &self,
+        topics: &Vec<String>,
+        num_partitions: i32,
+    ) -> KafkaResult<()> {
         let mut xd = Vec::new();
         for topic in topics {
             let new_topic = NewTopic::new(topic, num_partitions, TopicReplication::Fixed(1));
