@@ -1,4 +1,6 @@
 use futures::future::join_all;
+use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
+use rdkafka::client::DefaultClientContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::Message;
@@ -26,10 +28,10 @@ impl Metrics {
 
     fn print_results(&self) {
         println!("{} Latency Percentiles:", self.name);
-        print!("p50: {}ms, ", self.p50);
-        print!("p95: {}ms, ", self.p95);
-        print!("p99: {}ms, ", self.p99);
-        print!("p999: {}ms", self.p999);
+        print!("p50: {:.2}ms, ", self.p50);
+        print!("p95: {:.2}ms, ", self.p95);
+        print!("p99: {:.2}ms, ", self.p99);
+        print!("p999: {:.2}ms", self.p999);
         println!();
     }
 }
@@ -77,6 +79,29 @@ async fn main() {
                 .expect("Consumer creation failed");
             let mut tpl = TopicPartitionList::new();
             let le_topic = format!("my_topic_{}", i);
+
+            let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+                .set("bootstrap.servers", brokers)
+                .create()
+                .expect("Failed to create Kafka admin client");
+
+            let new_topic = NewTopic::new(&le_topic, 1, TopicReplication::Fixed(1))
+                .set("segment.bytes", "1073741824");
+
+            match admin
+                .create_topics(&[new_topic], &AdminOptions::new())
+                .await {
+                    Ok(result) => {
+                        for res in result {
+                            if let Ok(r) = res {
+                                println!("topic created: {}", r);
+                            }
+                        }
+
+                    }
+                    Err(_) => {}
+                }
+
             tpl.add_partition(&le_topic, 0);
             consumer.assign(&tpl).expect("Failed to assign partition");
 
@@ -114,14 +139,17 @@ async fn main() {
                         match consumer.recv().await {
                             Err(e) => eprintln!("Error receiving message: {:?}", e),
                             Ok(m) => {
+                                //if consumed == 0 {
+                                    let now = SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_millis()
+                                        as i64;
+                                    let timestamp = m.timestamp().to_millis().unwrap();
+                                    let latency = (now - timestamp) as u128;
+                                    metrics.latencies.push(latency);
+                                //}
                                 consumed += 1;
-                                let now = SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_millis() as i64;
-                                let timestamp = m.timestamp().to_millis().unwrap();
-                                let latency = (now - timestamp) as u128;
-                                metrics.latencies.push(latency);
                             }
                         }
                         if consumed == 1024 {
