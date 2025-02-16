@@ -26,10 +26,11 @@ impl Metrics {
 
     fn print_results(&self) {
         println!("{} Latency Percentiles:", self.name);
-        println!("  p50: {}ms", self.p50);
-        println!("  p95: {}ms", self.p95);
-        println!("  p99: {}ms", self.p99);
-        println!("  p999: {}ms", self.p999);
+        print!("p50: {}ms, ", self.p50);
+        print!("p95: {}ms, ", self.p95);
+        print!("p99: {}ms, ", self.p99);
+        print!("p999: {}ms", self.p999);
+        println!();
     }
 }
 
@@ -55,7 +56,7 @@ async fn main() {
     let brokers = "localhost:19092";
 
     let mut handles = Vec::with_capacity(10);
-    for i in 0..8 {
+    for i in 0..4 {
         let handle = tokio::task::spawn(async move {
             let producer: BaseProducer = ClientConfig::new()
                 .set("bootstrap.servers", brokers)
@@ -111,7 +112,7 @@ async fn main() {
                     let mut consumed = 0;
                     loop {
                         match consumer.recv().await {
-                            Err(e) => eprintln!("Actor numero {} Error receiving message: {:?}",i , e),
+                            Err(e) => eprintln!("Error receiving message: {:?}", e),
                             Ok(m) => {
                                 consumed += 1;
                                 let now = SystemTime::now()
