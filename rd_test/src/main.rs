@@ -1,220 +1,138 @@
-use std::{
-    num::NonZeroU32,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use futures::future::join_all;
+use rdkafka::config::ClientConfig;
+use rdkafka::consumer::{Consumer, StreamConsumer};
+use rdkafka::message::Message;
+use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
+use rdkafka::TopicPartitionList;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use admin::Admin;
-use futures::{
-    future::{select_all, try_join_all},
-    stream, StreamExt,
-};
-use rdkafka::{
-    consumer::{BaseConsumer, Consumer, StreamConsumer},
-    producer::{
-        BaseProducer, BaseRecord, FutureProducer, FutureRecord, Producer, ThreadedProducer,
-    },
-    statistics::TopicPartition,
-    util::Timeout,
-    ClientConfig, Message, Timestamp, TopicPartitionList,
-};
-use tokio::time::Instant;
-pub mod admin;
-use std::thread::sleep;
+struct Metrics {
+    name: String,
+    latencies: Vec<u128>,
+    p999: f64,
+    p99: f64,
+    p95: f64,
+    p50: f64,
+}
+
+impl Metrics {
+    fn calculate_tail_latencies(&mut self) {
+        self.latencies.sort();
+        self.p99 = calculate_percentile(&self.latencies, 99.0);
+        self.p999 = calculate_percentile(&self.latencies, 99.9);
+        self.p95 = calculate_percentile(&self.latencies, 95.0);
+        self.p50 = calculate_percentile(&self.latencies, 50.0);
+    }
+
+    fn print_results(&self) {
+        println!("{} Latency Percentiles:", self.name);
+        println!("  p50: {}ms", self.p50);
+        println!("  p95: {}ms", self.p95);
+        println!("  p99: {}ms", self.p99);
+        println!("  p999: {}ms", self.p999);
+    }
+}
+
+fn calculate_percentile(sorted_data: &[u128], percentile: f64) -> f64 {
+    if sorted_data.is_empty() {
+        return 0.0;
+    }
+
+    let rank = percentile / 100.0 * (sorted_data.len() - 1) as f64;
+    let lower = rank.floor() as usize;
+    let upper = rank.ceil() as usize;
+
+    if upper >= sorted_data.len() {
+        return sorted_data[sorted_data.len() - 1] as f64;
+    }
+
+    let weight = rank - lower as f64;
+    sorted_data[lower] as f64 * (1.0 - weight) + sorted_data[upper] as f64 * weight
+}
+
 #[tokio::main]
 async fn main() {
     let brokers = "localhost:19092";
-    let base_topic = "test";
-    let total_messages = 8_000_000;
-    let num_producers: usize = 8;
-    let message_size = 1024;
-    let messages_in_batch = 1000;
-    let batches_count = (total_messages / messages_in_batch) / num_producers;
 
-    let mut topics = Vec::new();
-    for id in 0..num_producers {
-        topics.push(format!("{}-{}", base_topic, id));
-    }
+    let mut handles = Vec::with_capacity(10);
+    for i in 0..8 {
+        let handle = tokio::task::spawn(async move {
+            let producer: BaseProducer = ClientConfig::new()
+                .set("bootstrap.servers", brokers)
+                .set("linger.ms", "10")
+                .set("batch.num.messages", "1024")
+                .create()
+                .expect("Producer creation error");
 
-    // Create admin client and topics
-    let mut topics = Vec::new();
-    for id in 0..num_producers {
-        let topic = format!("{}-{}", base_topic, id);
-        topics.push(topic);
-    }
-    let admin = Admin::new(&brokers);
-    admin.create_topics(&topics, 1).await.unwrap();
-    let topics = Arc::new(topics);
+            let cg_id = format!("my_cg_{}", i);
+            let consumer: StreamConsumer = ClientConfig::new()
+                .set("group.id", cg_id)
+                .set("bootstrap.servers", brokers)
+                .set("enable.auto.commit", "true")
+                .set("fetch.min.bytes", "1048576")
+                .set("fetch.wait.max.ms", "100")
+                .set("auto.offset.reset", "earliest")
+                .create()
+                .expect("Consumer creation failed");
+            let mut tpl = TopicPartitionList::new();
+            let le_topic = format!("my_topic_{}", i);
+            tpl.add_partition(&le_topic, 0);
+            consumer.assign(&tpl).expect("Failed to assign partition");
 
-    let mut handles = vec![];
-    for thread_id in 0..num_producers {
-        let brokers = brokers.to_string();
-        let topics = Arc::clone(&topics);
-        let handle = std::thread::spawn(move || {
-            // Create producer wrapped in Arc for thread-safe sharing
-            let producer: Arc<BaseProducer> = Arc::new(
-                ClientConfig::new()
-                    .set("bootstrap.servers", &brokers)
-                    .set("linger.ms", "10")
-                    .set("batch.num.messages", "1000")
-                    .set("batch.size", "1048588") 
-                    .set("message.max.bytes", "2048588") // ~2MB
-                    .create()
-                    .expect("Producer creation failed"),
-            );
+            let mut metrics = Metrics {
+                name: format!("Actor numero {}", i),
+                latencies: Vec::new(),
+                p999: 0.0,
+                p99: 0.0,
+                p95: 0.0,
+                p50: 0.0,
+            };
 
-            // Create consumer
-            let consumer: Arc<BaseConsumer> = Arc::new(
-                ClientConfig::new()
-                    .set("bootstrap.servers", &brokers)
-                    .set("auto.offset.reset", "earliest")
-                    .set("group.id", format!("manual_consumer_{}", thread_id))
-                    .set("enable.auto.commit", "false")
-                    .set("fetch.min.bytes", "102400")
-                    .create()
-                    .expect("Consumer creation failed"),
-            );
+            let message_size = 1024; // 1 KB
+            let payload = "a".repeat(message_size);
+            for i in 0..1000000 {
+                let key = format!("key-{}", i);
+                let timestamp = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis();
+                let record = BaseRecord::to(&le_topic)
+                    .partition(0)
+                    .timestamp(timestamp as i64)
+                    .payload(&payload)
+                    .key(&key);
 
-            let topic = &topics[thread_id];
-            let mut tpl = rdkafka::TopicPartitionList::new();
-            tpl.add_partition(topic, 0);
-            consumer.assign(&tpl).expect("Assignment failed");
-
-            let payload = vec![0u8; message_size];
-            let st = String::from_utf8(payload).unwrap();
-            let mut stats = LocalStats::new(thread_id);
-            let mut batches_sent = 0;
-
-            while batches_sent < batches_count {
-                for _ in 1..=messages_in_batch {
-                    let timestamp = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_millis() as i64;
-
-                    let record = BaseRecord::to(topic)
-                        .key("test")
-                        .payload(&st)
-                        .timestamp(timestamp);
-
-                    if let Err((e, _)) = producer.send(record) {
-                        stats.log_error();
-                        eprintln!("[Thread {}] Error: {}", thread_id, e);
-                    }
+                if let Err((e, _)) = producer.send(record) {
+                    eprintln!("Failed to send message {}: {:?}", i, e);
                 }
-                stats.record_batch();
-                producer.flush(Duration::from_secs(10)).unwrap();
-                batches_sent += 1;
-                let consumer = consumer.clone();
 
-                while let Some(message) = consumer.poll(Duration::from_millis(3)) {
-                    match message {
-                        Ok(msg) => {
-                            let timestamp = msg.timestamp();
-                            if let Some(t) = timestamp.to_millis() {
-                                let latency = SystemTime::now()
+                if i % 1024 == 0 && i != 0 {
+                    producer.flush(Duration::from_secs(100)).unwrap();
+                    let mut consumed = 0;
+                    loop {
+                        match consumer.recv().await {
+                            Err(e) => eprintln!("Actor numero {} Error receiving message: {:?}",i , e),
+                            Ok(m) => {
+                                consumed += 1;
+                                let now = SystemTime::now()
                                     .duration_since(UNIX_EPOCH)
                                     .unwrap()
-                                    .as_millis()
-                                    as i64
-                                    - t;
-                                stats.record_latency(latency as f64);
+                                    .as_millis() as i64;
+                                let timestamp = m.timestamp().to_millis().unwrap();
+                                let latency = (now - timestamp) as u128;
+                                metrics.latencies.push(latency);
                             }
                         }
-                        Err(e) => {
-                            eprintln!("Error consuming message: {}", e);
+                        if consumed == 1024 {
+                            break;
                         }
                     }
                 }
-                consumer
-                     .commit_consumer_state(rdkafka::consumer::CommitMode::Async)
-                     .unwrap();
             }
-            stats.print_final();
-            stats
+            metrics.calculate_tail_latencies();
+            metrics.print_results();
         });
         handles.push(handle);
     }
-
-    // Collect and aggregate statistics
-    let mut all_latencies = Vec::new();
-    let mut total_errors = 0;
-
-    for handle in handles {
-        if let Ok(thread_stats) = handle.join() {
-            all_latencies.extend(thread_stats.latencies);
-            total_errors += thread_stats.error_count;
-        }
-    }
-
-    all_latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let p99 = calculate_percentile(&all_latencies, 99.0);
-    let p95 = calculate_percentile(&all_latencies, 95.0);
-    let p50 = calculate_percentile(&all_latencies, 50.0);
-
-    println!("\nGlobal Statistics:");
-    println!("Total Messages: {}", total_messages);
-    println!("Total Errors:   {}", total_errors);
-    println!("p99 Latency:    {:.2}ms", p99);
-    println!("p95 Latency:    {:.2}ms", p95);
-    println!("p50 Latency:    {:.2}ms", p50);
-}
-
-// Rest of the LocalStats implementation and calculate_percentile remain the same
-
-struct LocalStats {
-    thread_id: usize,
-    latencies: Vec<f64>,
-    error_count: usize,
-    batch_count: usize,
-    start_time: Instant,
-    batch_time: Instant,
-}
-
-impl LocalStats {
-    fn new(thread_id: usize) -> Self {
-        Self {
-            thread_id,
-            latencies: Vec::new(),
-            error_count: 0,
-            batch_count: 0,
-            start_time: Instant::now(),
-            batch_time: Instant::now(),
-        }
-    }
-
-    fn record_batch(&mut self) {
-        self.batch_count += 1;
-        self.batch_time = Instant::now();
-    }
-
-    fn record_latency(&mut self, latency: f64) {
-        self.latencies.push(latency);
-    }
-
-    fn log_error(&mut self) {
-        self.error_count += 1;
-    }
-
-    fn print_final(&mut self) {
-        let total_time = self.start_time.elapsed().as_secs_f64();
-        let throughput = (self.batch_count * 1000) as f64 / total_time;
-        self.latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let p99 = calculate_percentile(&self.latencies, 99.0);
-        let p95 = calculate_percentile(&self.latencies, 95.0);
-        let p50 = calculate_percentile(&self.latencies, 50.0);
-        println!(
-            "[Thread {}] Final: {:.0} msg/s | p50: {:.2}ms | p95: {:.2}ms | p99: {:.2}ms | Errors: {}",
-            self.thread_id, throughput, p50, p95, p99, self.error_count
-        );
-    }
-}
-
-fn calculate_percentile(data: &[f64], percentile: f64) -> f64 {
-    let len = data.len();
-    if len == 0 {
-        return 0.0;
-    }
-    let index = (percentile / 100.0 * len as f64) as usize;
-    data[index.min(len - 1)]
+    join_all(handles).await;
 }
