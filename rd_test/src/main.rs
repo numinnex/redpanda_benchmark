@@ -12,6 +12,7 @@ struct Metrics {
     name: String,
     latencies: Vec<u128>,
     p999: f64,
+    p9999: f64,
     p99: f64,
     p95: f64,
     p50: f64,
@@ -19,11 +20,13 @@ struct Metrics {
 
 impl Metrics {
     fn calculate_tail_latencies(&mut self) {
-        self.latencies.sort();
-        self.p99 = calculate_percentile(&self.latencies, 99.0);
-        self.p999 = calculate_percentile(&self.latencies, 99.9);
-        self.p95 = calculate_percentile(&self.latencies, 95.0);
-        self.p50 = calculate_percentile(&self.latencies, 50.0);
+        let mut latencies = self.latencies.drain(2000000..).collect::<Vec<_>>();
+        latencies.sort();
+        self.p99 = calculate_percentile(&latencies, 99.0);
+        self.p999 = calculate_percentile(&latencies, 99.9);
+        self.p9999 = calculate_percentile(&latencies, 99.99);
+        self.p95 = calculate_percentile(&latencies, 95.0);
+        self.p50 = calculate_percentile(&latencies, 50.0);
     }
 
     fn print_results(&self) {
@@ -31,7 +34,8 @@ impl Metrics {
         print!("p50: {:.2}ms, ", self.p50);
         print!("p95: {:.2}ms, ", self.p95);
         print!("p99: {:.2}ms, ", self.p99);
-        print!("p999: {:.2}ms", self.p999);
+        print!("p999: {:.2}ms, ", self.p999);
+        print!("p9999: {:.2}ms", self.p9999);
         println!();
     }
 }
@@ -108,6 +112,7 @@ async fn main() {
             let mut metrics = Metrics {
                 name: format!("Actor numero {}", i),
                 latencies: Vec::new(),
+                p9999: 0.0,
                 p999: 0.0,
                 p99: 0.0,
                 p95: 0.0,
@@ -116,7 +121,7 @@ async fn main() {
 
             let message_size = 1024; // 1 KB
             let payload = "a".repeat(message_size);
-            for i in 0..1000000 {
+            for i in 0..5000000 {
                 let key = format!("key-{}", i);
                 let timestamp = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
